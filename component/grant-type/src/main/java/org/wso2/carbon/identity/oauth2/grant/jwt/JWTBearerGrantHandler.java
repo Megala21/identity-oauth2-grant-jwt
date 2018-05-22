@@ -28,19 +28,25 @@ import org.apache.commons.lang.StringUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.wso2.carbon.identity.application.authentication.framework.model.AuthenticatedUser;
+import org.wso2.carbon.identity.application.authentication.framework.util.FrameworkUtils;
+import org.wso2.carbon.identity.application.common.IdentityApplicationManagementException;
+import org.wso2.carbon.identity.application.common.model.ClaimMapping;
 import org.wso2.carbon.identity.application.common.model.FederatedAuthenticatorConfig;
 import org.wso2.carbon.identity.application.common.model.IdentityProvider;
 import org.wso2.carbon.identity.application.common.model.Property;
 import org.wso2.carbon.identity.application.common.util.IdentityApplicationConstants;
 import org.wso2.carbon.identity.application.common.util.IdentityApplicationManagementUtil;
+import org.wso2.carbon.identity.base.IdentityException;
 import org.wso2.carbon.identity.core.util.IdentityUtil;
 import org.wso2.carbon.identity.oauth.config.OAuthServerConfiguration;
 import org.wso2.carbon.identity.oauth2.IdentityOAuth2Exception;
+import org.wso2.carbon.identity.oauth2.dto.OAuth2AccessTokenRespDTO;
 import org.wso2.carbon.identity.oauth2.grant.jwt.cache.JWTCache;
 import org.wso2.carbon.identity.oauth2.grant.jwt.cache.JWTCacheEntry;
 import org.wso2.carbon.identity.oauth2.model.RequestParameter;
 import org.wso2.carbon.identity.oauth2.token.OAuthTokenReqMessageContext;
 import org.wso2.carbon.identity.oauth2.token.handlers.grant.AbstractAuthorizationGrantHandler;
+import org.wso2.carbon.identity.oauth2.util.ClaimsUtil;
 import org.wso2.carbon.identity.oauth2.util.OAuth2Util;
 import org.wso2.carbon.idp.mgt.IdentityProviderManagementException;
 import org.wso2.carbon.idp.mgt.IdentityProviderManager;
@@ -54,10 +60,13 @@ import java.security.cert.X509Certificate;
 import java.security.interfaces.RSAPublicKey;
 import java.text.ParseException;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 
+import static org.wso2.carbon.identity.oauth2.util.ClaimsUtil.handleClaimsForIDP;
+import static org.wso2.carbon.identity.oauth2.util.ClaimsUtil.handleClaimsForResidentIDP;
 
 /**
  * Class to handle JSON Web Token(JWT) grant type
@@ -158,7 +167,7 @@ public class JWTBearerGrantHandler extends AbstractAuthorizationGrantHandler {
 //        super.validateGrant(tokReqMsgCtx); //This line was commented to work with IS 5.2.0
 
         SignedJWT signedJWT;
-        IdentityProvider identityProvider;
+        IdentityProvider identityProvider = null;
         String tokenEndPointAlias = null;
         ReadOnlyJWTClaimsSet claimsSet;
 
@@ -179,6 +188,8 @@ public class JWTBearerGrantHandler extends AbstractAuthorizationGrantHandler {
         String subject = resolveSubject(claimsSet);
         List<String> audience = claimsSet.getAudience();
         Date expirationTime = claimsSet.getExpirationTime();
+
+        tokReqMsgCtx.addProperty(JWTConstants.EXPIRY_TIME, expirationTime);
         Date notBeforeTime = claimsSet.getNotBeforeTime();
         Date issuedAtTime = claimsSet.getIssueTime();
         String jti = claimsSet.getJWTID();
@@ -218,12 +229,16 @@ public class JWTBearerGrantHandler extends AbstractAuthorizationGrantHandler {
                 handleException("Signature or Message Authentication invalid.");
             }
 
+            AuthenticatedUser authenticatedUser;
             if (Boolean.parseBoolean(IdentityUtil.getProperty(OAUTH_SPLIT_AUTHZ_USER_3_WAY))) {
-                tokReqMsgCtx.setAuthorizedUser(OAuth2Util.getUserFromUserName(subject));
+                authenticatedUser = OAuth2Util.getUserFromUserName(subject);
+                authenticatedUser.setAuthenticatedSubjectIdentifier(subject);
             } else {
-                tokReqMsgCtx.setAuthorizedUser(AuthenticatedUser
-                        .createLocalAuthenticatedUserFromSubjectIdentifier(subject));
+                authenticatedUser = AuthenticatedUser.createLocalAuthenticatedUserFromSubjectIdentifier(subject);
             }
+            authenticatedUser.setFederatedUser(true);
+            tokReqMsgCtx.setAuthorizedUser(authenticatedUser);
+
             if (log.isDebugEnabled()) {
                 log.debug("Subject(sub) found in JWT: " + subject);
                 log.debug(subject + " set as the Authorized User.");
@@ -327,7 +342,80 @@ public class JWTBearerGrantHandler extends AbstractAuthorizationGrantHandler {
         if (log.isDebugEnabled()) {
             log.debug("Issuer(iss) of the JWT validated successfully");
         }
+        if (OAuth2Util.isOIDCAuthzRequest(tokReqMsgCtx.getScope())) {
+            handleCustomClaims(tokReqMsgCtx, customClaims, identityProvider);
+        }
         return true;
+    }
+
+    /**
+     * Handle the custom claims and add it to the relevant authorized user, in the validation phase, so that when
+     * issuing the access token we could use the same attributes later.
+     *
+     * @param tokReqMsgCtx     OauthTokenReqMessageContext
+     * @param customClaims     Custom Claims
+     * @param identityProvider Identity Provider
+     * @throws IdentityOAuth2Exception Identity Oauth2 Exception
+     */
+    private void handleCustomClaims(OAuthTokenReqMessageContext tokReqMsgCtx, Map<String, Object> customClaims,
+            IdentityProvider identityProvider) throws IdentityOAuth2Exception {
+
+        Map<String, String> customClaimMap = getCustomClaims(customClaims);
+        Map<ClaimMapping, String> claimMappings = null;
+
+        boolean localClaimDialect = identityProvider.getClaimConfig().isLocalClaimDialect();
+        ClaimMapping[] idPClaimMappings = identityProvider.getClaimConfig().getClaimMappings();
+        Map<String, String> localClaims;
+
+        if (IdentityApplicationConstants.RESIDENT_IDP_RESERVED_NAME
+                .equals(identityProvider.getIdentityProviderName())) {
+            localClaims = handleClaimsForResidentIDP(customClaimMap, identityProvider);
+        } else {
+            localClaims = handleClaimsForIDP(customClaimMap, tenantDomain, identityProvider, localClaimDialect,
+                    idPClaimMappings);
+        }
+
+        // ########################### all claims are in local dialect ############################
+
+        if (localClaims != null && localClaims.size() > 0) {
+            Map<String, String> oidcClaims;
+            try {
+                oidcClaims = ClaimsUtil.convertClaimsToOIDCDialect(tokReqMsgCtx, localClaims);
+            } catch (IdentityApplicationManagementException | IdentityException e) {
+                throw new IdentityOAuth2Exception("Error while converting user claims to OIDC dialect" + ".");
+            }
+            claimMappings = FrameworkUtils.buildClaimMappings(oidcClaims);
+        }
+        AuthenticatedUser user = tokReqMsgCtx.getAuthorizedUser();
+        user.setUserAttributes(claimMappings);
+        tokReqMsgCtx.setAuthorizedUser(user);
+    }
+
+    @Override
+    public OAuth2AccessTokenRespDTO issue(OAuthTokenReqMessageContext tokReqMsgCtx) throws IdentityOAuth2Exception {
+
+        OAuth2AccessTokenRespDTO tokenRespDTO = super.issue(tokReqMsgCtx);
+        if (OAuth2Util.isOIDCAuthzRequest(tokReqMsgCtx.getScope())) {
+            AuthenticatedUser user = tokReqMsgCtx.getAuthorizedUser();
+            ClaimsUtil.addUserAttributesToCache(tokenRespDTO, tokReqMsgCtx, user.getUserAttributes());
+        }
+        return tokenRespDTO;
+    }
+
+    /**
+     * To get the custom claims map using the custom claims of JWT
+     *
+     * @param customClaims Relevant custom claims
+     * @return custom claims.
+     */
+    private Map<String, String> getCustomClaims(Map<String, Object> customClaims) {
+
+        Map<String, String> customClaimMap = new HashMap<>();
+        for (Map.Entry<String, Object> entry : customClaims.entrySet()) {
+            Object value = entry.getValue();
+            customClaimMap.put(entry.getKey(), value.toString());
+        }
+        return customClaimMap;
     }
 
     /**
