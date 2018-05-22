@@ -29,20 +29,25 @@ import org.apache.commons.lang.StringUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.wso2.carbon.identity.application.authentication.framework.model.AuthenticatedUser;
-import org.wso2.carbon.identity.application.common.model.FederatedAuthenticatorConfig;
-import org.wso2.carbon.identity.application.common.model.IdentityProvider;
-import org.wso2.carbon.identity.application.common.model.IdentityProviderProperty;
-import org.wso2.carbon.identity.application.common.model.Property;
+import org.wso2.carbon.identity.application.authentication.framework.util.FrameworkUtils;
+import org.wso2.carbon.identity.application.common.IdentityApplicationManagementException;
+import org.wso2.carbon.identity.application.common.model.*;
 import org.wso2.carbon.identity.application.common.util.IdentityApplicationConstants;
 import org.wso2.carbon.identity.application.common.util.IdentityApplicationManagementUtil;
+import org.wso2.carbon.identity.base.IdentityException;
 import org.wso2.carbon.identity.core.util.IdentityUtil;
+import org.wso2.carbon.identity.oauth.cache.AuthorizationGrantCache;
+import org.wso2.carbon.identity.oauth.cache.AuthorizationGrantCacheEntry;
+import org.wso2.carbon.identity.oauth.cache.AuthorizationGrantCacheKey;
 import org.wso2.carbon.identity.oauth.config.OAuthServerConfiguration;
 import org.wso2.carbon.identity.oauth2.IdentityOAuth2Exception;
+import org.wso2.carbon.identity.oauth2.dto.OAuth2AccessTokenRespDTO;
 import org.wso2.carbon.identity.oauth2.grant.jwt.cache.JWTCache;
 import org.wso2.carbon.identity.oauth2.grant.jwt.cache.JWTCacheEntry;
 import org.wso2.carbon.identity.oauth2.model.RequestParameter;
 import org.wso2.carbon.identity.oauth2.token.OAuthTokenReqMessageContext;
 import org.wso2.carbon.identity.oauth2.token.handlers.grant.AbstractAuthorizationGrantHandler;
+import org.wso2.carbon.identity.oauth2.util.ClaimsUtil;
 import org.wso2.carbon.identity.oauth2.util.OAuth2Util;
 import org.wso2.carbon.identity.oauth2.validators.jwt.JWKSBasedJWTValidator;
 import org.wso2.carbon.idp.mgt.IdentityProviderManagementException;
@@ -57,10 +62,10 @@ import java.security.cert.X509Certificate;
 import java.security.interfaces.RSAPublicKey;
 import java.text.ParseException;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
-
 
 /**
  * Class to handle JSON Web Token(JWT) grant type
@@ -332,6 +337,149 @@ public class JWTBearerGrantHandler extends AbstractAuthorizationGrantHandler {
         }
         return true;
     }
+
+    @Override
+    public OAuth2AccessTokenRespDTO issue(OAuthTokenReqMessageContext tokReqMsgCtx) throws IdentityOAuth2Exception {
+
+        OAuth2AccessTokenRespDTO responseDTO = super.issue(tokReqMsgCtx);
+        String[] scope = tokReqMsgCtx.getScope();
+        if (OAuth2Util.isOIDCAuthzRequest(scope)) {
+            handleCustomClaims(tokReqMsgCtx, responseDTO);
+        }
+        return responseDTO;
+    }
+
+    private void handleCustomClaims(OAuthTokenReqMessageContext tokReqMsgCtx, OAuth2AccessTokenRespDTO responseDTO) throws
+            IdentityOAuth2Exception {
+        SignedJWT signedJWT = getSignedJWT(tokReqMsgCtx);
+
+        // Ignore null checks since the execution comes to this phase only if validate grant phase is passed.
+        // Hence, continuing without null check.
+        JWTClaimsSet claimsSet = getClaimSet(signedJWT);
+
+        Map<String, String> customClaimMap = getClaims(claimsSet);
+        String jwtIssuer = claimsSet.getIssuer();
+
+        String tenantDomain = tokReqMsgCtx.getOauth2AccessTokenReqDTO().getTenantDomain();
+        if (StringUtils.isBlank(tenantDomain)) {
+            tenantDomain = org.wso2.carbon.base.MultitenantConstants.SUPER_TENANT_DOMAIN_NAME;
+        }
+
+        IdentityProvider identityProvider = null;
+        try {
+            identityProvider = IdentityProviderManager.getInstance().getIdPByName(jwtIssuer, tenantDomain);
+        } catch (IdentityProviderManagementException e) {
+            handleException(
+                    "Error while getting IDP based on the jwt issuer " + jwtIssuer + "  for the tenant " + "domain "
+                            + tenantDomain, e);
+        }
+
+        boolean localClaimDialect = identityProvider.getClaimConfig().isLocalClaimDialect();
+        ClaimMapping[] idPClaimMappings = identityProvider.getClaimConfig().getClaimMappings();
+        Map<String, String> localClaims;
+
+        if (IdentityApplicationConstants.RESIDENT_IDP_RESERVED_NAME
+                .equals(identityProvider.getIdentityProviderName())) {
+            localClaims = handleClaimsForResidentIDP(customClaimMap, identityProvider);
+        } else {
+            localClaims = handleClaimsForIDP(customClaimMap, tenantDomain, identityProvider, localClaimDialect,
+                    idPClaimMappings);
+        }
+
+        // ########################### all claims are in local dialect ############################
+
+        if (localClaims != null && localClaims.size() > 0) {
+            Map<String, String> oidcClaims;
+            try {
+                oidcClaims = ClaimsUtil.convertClaimsToOIDCDialect(tokReqMsgCtx, localClaims);
+            } catch (IdentityApplicationManagementException | IdentityException e) {
+                throw new IdentityOAuth2Exception("Error while converting user claims to OIDC dialect" + ".");
+            }
+            Map<ClaimMapping, String> claimMappings = FrameworkUtils.buildClaimMappings(oidcClaims);
+            addUserAttributesToCache(responseDTO, tokReqMsgCtx, claimMappings);
+        }
+
+    }
+    private Map<String, String> getClaims(JWTClaimsSet claimsSet) {
+
+        Map<String, Object> customClaims = claimsSet.getClaims();
+        Map<String, String> customClaimMap = new HashMap<>();
+        for (Map.Entry<String, Object> entry : customClaims.entrySet()) {
+            Object value = entry.getValue();
+            customClaimMap.put(entry.getKey(), value.toString());
+        }
+        return customClaimMap;
+    }
+
+    protected Map<String, String> handleClaimsForResidentIDP(Map<String, String> attributes, IdentityProvider
+            identityProvider) {
+
+        boolean localClaimDialect;
+        Map<String, String> localClaims = new HashMap<>();
+        localClaimDialect = identityProvider.getClaimConfig().isLocalClaimDialect();
+        if (localClaimDialect) {
+            localClaims = handleLocalClaims(attributes, identityProvider);
+        } else {
+            if (ClaimsUtil.isInLocalDialect(attributes)) {
+                localClaims = attributes;
+                if (log.isDebugEnabled()) {
+                    log.debug("IDP claims dialect is not local. But claims are in local dialect " +
+                            "for identity provider: " + identityProvider.getIdentityProviderName() +
+                            ". Using attributes in assertion as the IDP claims.");
+                }
+            } else {
+                if (log.isDebugEnabled()) {
+                    log.debug("IDP claims dialect is not local. These claims are not handled for " +
+                            "identity provider: " + identityProvider.getIdentityProviderName());
+                }
+            }
+
+        }
+        return localClaims;
+    }
+
+    protected Map<String, String> handleClaimsForIDP(Map<String, String> attributes, String tenantDomain,
+            IdentityProvider identityProvider, boolean localClaimDialect,
+            ClaimMapping[] idPClaimMappings) {
+
+        Map<String, String> localClaims;
+        if (localClaimDialect) {
+            localClaims = handleLocalClaims(attributes, identityProvider);
+        } else {
+            if (idPClaimMappings.length > 0) {
+                localClaims = ClaimsUtil.convertFederatedClaimsToLocalDialect(attributes, idPClaimMappings,
+                        tenantDomain);
+                if (log.isDebugEnabled()) {
+                    log.debug("IDP claims dialect is not local. Converted claims for " +
+                            "identity provider: " + identityProvider.getIdentityProviderName());
+                }
+            } else {
+                localClaims = handleLocalClaims(attributes, identityProvider);
+            }
+        }
+        return localClaims;
+    }
+
+    private Map<String, String> handleLocalClaims(Map<String, String> attributes, IdentityProvider identityProvider) {
+
+        Map<String, String> localClaims = new HashMap<>();
+        if (ClaimsUtil.isInLocalDialect(attributes)) {
+            localClaims = attributes;
+            if (log.isDebugEnabled()) {
+                log.debug("Claims are in local dialect for " +
+                        "identity provider: " + identityProvider.getIdentityProviderName() +
+                        ". Using attributes in assertion as the IDP claims.");
+            }
+        } else {
+            if (log.isDebugEnabled()) {
+                log.debug("Claims are not in local dialect " +
+                        "for identity provider: " + identityProvider.getIdentityProviderName() +
+                        ". Not considering attributes in assertion.");
+            }
+        }
+        return localClaims;
+    }
+
 
     /**
      * the default implementation creates the subject from the Sub attribute.
@@ -657,6 +805,22 @@ public class JWTBearerGrantHandler extends AbstractAuthorizationGrantHandler {
         return x509Certificate;
     }
 
+    protected static void addUserAttributesToCache(OAuth2AccessTokenRespDTO tokenRespDTO, OAuthTokenReqMessageContext
+            msgCtx, Map<ClaimMapping, String> userAttributes) {
+
+        AuthorizationGrantCacheKey authorizationGrantCacheKey = new AuthorizationGrantCacheKey(tokenRespDTO
+                .getAccessToken());
+        AuthorizationGrantCacheEntry authorizationGrantCacheEntry = new AuthorizationGrantCacheEntry(userAttributes);
+        authorizationGrantCacheEntry.setSubjectClaim(msgCtx.getAuthorizedUser().getAuthenticatedSubjectIdentifier());
+
+        if (StringUtils.isNotBlank(tokenRespDTO.getTokenId())) {
+            authorizationGrantCacheEntry.setTokenId(tokenRespDTO.getTokenId());
+        }
+
+        AuthorizationGrantCache.getInstance().addToCacheByToken(authorizationGrantCacheKey,
+                authorizationGrantCacheEntry);
+    }
+
     /**
      * Method to validate the claims other than
      * iss - Issuer
@@ -681,5 +845,17 @@ public class JWTBearerGrantHandler extends AbstractAuthorizationGrantHandler {
     private void handleException(String errorMessage) throws IdentityOAuth2Exception {
         log.error(errorMessage);
         throw new IdentityOAuth2Exception(errorMessage);
+    }
+
+    /**
+     * To handle exception.
+     *
+     * @param errorMessage Error Message.
+     * @param e            Throwable throwable.
+     * @throws IdentityOAuth2Exception Identity Oauth2 Exception.
+     */
+    private void handleException(String errorMessage, Throwable e) throws IdentityOAuth2Exception {
+        log.error(errorMessage, e);
+        throw new IdentityOAuth2Exception(errorMessage, e);
     }
 }
