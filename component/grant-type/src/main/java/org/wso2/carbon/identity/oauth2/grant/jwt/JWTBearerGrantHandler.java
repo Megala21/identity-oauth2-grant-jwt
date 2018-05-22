@@ -28,19 +28,28 @@ import org.apache.commons.lang.StringUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.wso2.carbon.identity.application.authentication.framework.model.AuthenticatedUser;
+import org.wso2.carbon.identity.application.authentication.framework.util.FrameworkUtils;
+import org.wso2.carbon.identity.application.common.IdentityApplicationManagementException;
+import org.wso2.carbon.identity.application.common.model.ClaimMapping;
 import org.wso2.carbon.identity.application.common.model.FederatedAuthenticatorConfig;
 import org.wso2.carbon.identity.application.common.model.IdentityProvider;
 import org.wso2.carbon.identity.application.common.model.Property;
 import org.wso2.carbon.identity.application.common.util.IdentityApplicationConstants;
 import org.wso2.carbon.identity.application.common.util.IdentityApplicationManagementUtil;
+import org.wso2.carbon.identity.base.IdentityException;
 import org.wso2.carbon.identity.core.util.IdentityUtil;
+import org.wso2.carbon.identity.oauth.cache.AuthorizationGrantCache;
+import org.wso2.carbon.identity.oauth.cache.AuthorizationGrantCacheEntry;
+import org.wso2.carbon.identity.oauth.cache.AuthorizationGrantCacheKey;
 import org.wso2.carbon.identity.oauth.config.OAuthServerConfiguration;
 import org.wso2.carbon.identity.oauth2.IdentityOAuth2Exception;
+import org.wso2.carbon.identity.oauth2.dto.OAuth2AccessTokenRespDTO;
 import org.wso2.carbon.identity.oauth2.grant.jwt.cache.JWTCache;
 import org.wso2.carbon.identity.oauth2.grant.jwt.cache.JWTCacheEntry;
 import org.wso2.carbon.identity.oauth2.model.RequestParameter;
 import org.wso2.carbon.identity.oauth2.token.OAuthTokenReqMessageContext;
 import org.wso2.carbon.identity.oauth2.token.handlers.grant.AbstractAuthorizationGrantHandler;
+import org.wso2.carbon.identity.oauth2.util.ClaimsUtil;
 import org.wso2.carbon.identity.oauth2.util.OAuth2Util;
 import org.wso2.carbon.idp.mgt.IdentityProviderManagementException;
 import org.wso2.carbon.idp.mgt.IdentityProviderManager;
@@ -54,10 +63,10 @@ import java.security.cert.X509Certificate;
 import java.security.interfaces.RSAPublicKey;
 import java.text.ParseException;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
-
 
 /**
  * Class to handle JSON Web Token(JWT) grant type
@@ -158,7 +167,7 @@ public class JWTBearerGrantHandler extends AbstractAuthorizationGrantHandler {
 //        super.validateGrant(tokReqMsgCtx); //This line was commented to work with IS 5.2.0
 
         SignedJWT signedJWT;
-        IdentityProvider identityProvider;
+        IdentityProvider identityProvider = null;
         String tokenEndPointAlias = null;
         ReadOnlyJWTClaimsSet claimsSet;
 
@@ -179,6 +188,8 @@ public class JWTBearerGrantHandler extends AbstractAuthorizationGrantHandler {
         String subject = resolveSubject(claimsSet);
         List<String> audience = claimsSet.getAudience();
         Date expirationTime = claimsSet.getExpirationTime();
+
+        tokReqMsgCtx.addProperty(JWTConstants.EXPIRY_TIME, expirationTime);
         Date notBeforeTime = claimsSet.getNotBeforeTime();
         Date issuedAtTime = claimsSet.getIssueTime();
         String jti = claimsSet.getJWTID();
@@ -218,12 +229,16 @@ public class JWTBearerGrantHandler extends AbstractAuthorizationGrantHandler {
                 handleException("Signature or Message Authentication invalid.");
             }
 
+            AuthenticatedUser authenticatedUser;
             if (Boolean.parseBoolean(IdentityUtil.getProperty(OAUTH_SPLIT_AUTHZ_USER_3_WAY))) {
-                tokReqMsgCtx.setAuthorizedUser(OAuth2Util.getUserFromUserName(subject));
+                authenticatedUser = OAuth2Util.getUserFromUserName(subject);
+                authenticatedUser.setAuthenticatedSubjectIdentifier(subject);
             } else {
-                tokReqMsgCtx.setAuthorizedUser(AuthenticatedUser
-                        .createLocalAuthenticatedUserFromSubjectIdentifier(subject));
+                authenticatedUser = AuthenticatedUser.createLocalAuthenticatedUserFromSubjectIdentifier(subject);
             }
+            authenticatedUser.setFederatedUser(true);
+            tokReqMsgCtx.setAuthorizedUser(authenticatedUser);
+
             if (log.isDebugEnabled()) {
                 log.debug("Subject(sub) found in JWT: " + subject);
                 log.debug(subject + " set as the Authorized User.");
@@ -327,8 +342,151 @@ public class JWTBearerGrantHandler extends AbstractAuthorizationGrantHandler {
         if (log.isDebugEnabled()) {
             log.debug("Issuer(iss) of the JWT validated successfully");
         }
+        handleCustomClaims(tokReqMsgCtx, customClaims, identityProvider);
         return true;
     }
+
+
+    private void handleCustomClaims(OAuthTokenReqMessageContext tokReqMsgCtx, Map<String, Object> customClaims,
+            IdentityProvider identityProvider) throws IdentityOAuth2Exception {
+
+        Map<String, String> customClaimMap = getClaims(customClaims);
+        Map<ClaimMapping, String> claimMappings = null;
+        boolean isOidcScope = OAuth2Util.isOIDCAuthzRequest(tokReqMsgCtx.getScope());
+
+        if (isOidcScope) {
+
+            boolean localClaimDialect = identityProvider.getClaimConfig().isLocalClaimDialect();
+            ClaimMapping[] idPClaimMappings = identityProvider.getClaimConfig().getClaimMappings();
+            Map<String, String> localClaims;
+
+            if (IdentityApplicationConstants.RESIDENT_IDP_RESERVED_NAME
+                    .equals(identityProvider.getIdentityProviderName())) {
+                localClaims = handleClaimsForResidentIDP(customClaimMap, identityProvider);
+            } else {
+                localClaims = handleClaimsForIDP(customClaimMap, tenantDomain, identityProvider, localClaimDialect,
+                        idPClaimMappings);
+            }
+
+            // ########################### all claims are in local dialect ############################
+
+            if (localClaims != null && localClaims.size() > 0) {
+                Map<String, String> oidcClaims;
+                try {
+                    oidcClaims = ClaimsUtil.convertClaimsToOIDCDialect(tokReqMsgCtx, localClaims);
+                } catch (IdentityApplicationManagementException | IdentityException e) {
+                    throw new IdentityOAuth2Exception("Error while converting user claims to OIDC dialect" + ".");
+                }
+                claimMappings = FrameworkUtils.buildClaimMappings(oidcClaims);
+            }
+        } else {
+
+            tokReqMsgCtx.addProperty(JWTConstants.CUSTOM_CLAIM_WITHOUT_OIDC, true);
+            claimMappings = FrameworkUtils.buildClaimMappings(customClaimMap);
+        }
+        AuthenticatedUser user = tokReqMsgCtx.getAuthorizedUser();
+        user.setUserAttributes(claimMappings);
+        tokReqMsgCtx.setAuthorizedUser(user);
+    }
+
+    public OAuth2AccessTokenRespDTO issue(OAuthTokenReqMessageContext tokReqMsgCtx) throws IdentityOAuth2Exception {
+        OAuth2AccessTokenRespDTO tokenRespDTO = super.issue(tokReqMsgCtx);
+
+        AuthenticatedUser user = tokReqMsgCtx.getAuthorizedUser();
+        AuthorizationGrantCacheKey authorizationGrantCacheKey = new AuthorizationGrantCacheKey(
+                tokenRespDTO.getAccessToken());
+        AuthorizationGrantCacheEntry authorizationGrantCacheEntry = new AuthorizationGrantCacheEntry(
+                user.getUserAttributes());
+        authorizationGrantCacheEntry.setSubjectClaim(user.getAuthenticatedSubjectIdentifier());
+
+        if (StringUtils.isNotBlank(tokenRespDTO.getTokenId())) {
+            authorizationGrantCacheEntry.setTokenId(tokenRespDTO.getTokenId());
+        }
+
+        AuthorizationGrantCache.getInstance()
+                .addToCacheByToken(authorizationGrantCacheKey, authorizationGrantCacheEntry);
+        return tokenRespDTO;
+    }
+
+    private Map<String, String> getClaims(Map<String, Object> customClaims) {
+
+        Map<String, String> customClaimMap = new HashMap<>();
+        for (Map.Entry<String, Object> entry : customClaims.entrySet()) {
+            Object value = entry.getValue();
+            customClaimMap.put(entry.getKey(), value.toString());
+        }
+        return customClaimMap;
+    }
+
+    private Map<String, String> handleClaimsForResidentIDP(Map<String, String> attributes,
+            IdentityProvider identityProvider) {
+
+        boolean localClaimDialect;
+        Map<String, String> localClaims = new HashMap<>();
+        localClaimDialect = identityProvider.getClaimConfig().isLocalClaimDialect();
+        if (localClaimDialect) {
+            localClaims = handleLocalClaims(attributes, identityProvider);
+        } else {
+            if (ClaimsUtil.isInLocalDialect(attributes)) {
+                localClaims = attributes;
+                if (log.isDebugEnabled()) {
+                    log.debug("IDP claims dialect is not local. But claims are in local dialect " +
+                            "for identity provider: " + identityProvider.getIdentityProviderName() +
+                            ". Using attributes in assertion as the IDP claims.");
+                }
+            } else {
+                if (log.isDebugEnabled()) {
+                    log.debug("IDP claims dialect is not local. These claims are not handled for " +
+                            "identity provider: " + identityProvider.getIdentityProviderName());
+                }
+            }
+
+        }
+        return localClaims;
+    }
+
+    protected Map<String, String> handleClaimsForIDP(Map<String, String> attributes, String tenantDomain,
+            IdentityProvider identityProvider, boolean localClaimDialect,
+            ClaimMapping[] idPClaimMappings) {
+
+        Map<String, String> localClaims;
+        if (localClaimDialect) {
+            localClaims = handleLocalClaims(attributes, identityProvider);
+        } else {
+            if (idPClaimMappings.length > 0) {
+                localClaims = ClaimsUtil.convertFederatedClaimsToLocalDialect(attributes, idPClaimMappings,
+                        tenantDomain);
+                if (log.isDebugEnabled()) {
+                    log.debug("IDP claims dialect is not local. Converted claims for " +
+                            "identity provider: " + identityProvider.getIdentityProviderName());
+                }
+            } else {
+                localClaims = handleLocalClaims(attributes, identityProvider);
+            }
+        }
+        return localClaims;
+    }
+
+    private Map<String, String> handleLocalClaims(Map<String, String> attributes, IdentityProvider identityProvider) {
+
+        Map<String, String> localClaims = new HashMap<>();
+        if (ClaimsUtil.isInLocalDialect(attributes)) {
+            localClaims = attributes;
+            if (log.isDebugEnabled()) {
+                log.debug("Claims are in local dialect for " +
+                        "identity provider: " + identityProvider.getIdentityProviderName() +
+                        ". Using attributes in assertion as the IDP claims.");
+            }
+        } else {
+            if (log.isDebugEnabled()) {
+                log.debug("Claims are not in local dialect " +
+                        "for identity provider: " + identityProvider.getIdentityProviderName() +
+                        ". Not considering attributes in assertion.");
+            }
+        }
+        return localClaims;
+    }
+
 
     /**
      * the default implementation creates the subject from the Sub attribute.
@@ -638,5 +796,17 @@ public class JWTBearerGrantHandler extends AbstractAuthorizationGrantHandler {
     private void handleException(String errorMessage) throws IdentityOAuth2Exception {
         log.error(errorMessage);
         throw new IdentityOAuth2Exception(errorMessage);
+    }
+
+    /**
+     * To handle exception.
+     *
+     * @param errorMessage Error Message.
+     * @param e            Throwable throwable.
+     * @throws IdentityOAuth2Exception Identity Oauth2 Exception.
+     */
+    private void handleException(String errorMessage, Throwable e) throws IdentityOAuth2Exception {
+        log.error(errorMessage, e);
+        throw new IdentityOAuth2Exception(errorMessage, e);
     }
 }

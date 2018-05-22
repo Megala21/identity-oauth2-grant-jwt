@@ -25,4 +25,8 @@ public class JWTConstants {
     public static final String CACHE_USED_JTI = "cacheUsed";
     public static final String PROPERTIES_FILE = "jwt.properties";
 
+    // Expiry time of the jwt token
+    public static final String EXPIRY_TIME = "EXPIRY_TIME_JWT";
+    public static final String CUSTOM_CLAIM_WITHOUT_OIDC = "CUSTOM_CLAIM_WITHOUT_OIDC";
+
 }
