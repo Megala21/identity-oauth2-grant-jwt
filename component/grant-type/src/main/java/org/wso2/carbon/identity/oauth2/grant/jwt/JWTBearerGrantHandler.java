@@ -343,7 +343,9 @@ public class JWTBearerGrantHandler extends AbstractAuthorizationGrantHandler {
             log.debug("Issuer(iss) of the JWT validated successfully");
         }
 
-        handleCustomClaims(tokReqMsgCtx, customClaims, identityProvider);
+        if (OAuth2Util.isOIDCAuthzRequest(tokReqMsgCtx.getScope())) {
+            handleCustomClaims(tokReqMsgCtx, customClaims, identityProvider);
+        }
         return true;
     }
 
@@ -360,40 +362,14 @@ public class JWTBearerGrantHandler extends AbstractAuthorizationGrantHandler {
             IdentityProvider identityProvider) throws IdentityOAuth2Exception {
 
         Map<String, String> customClaimMap = getCustomClaims(customClaims);
-        Map<ClaimMapping, String> claimMappings = null;
+        Map<String, String> mappedClaims = ClaimsUtil
+                .handleClaimMapping(identityProvider, customClaimMap, tenantDomain, tokReqMsgCtx);
 
-        if (OAuth2Util.isOIDCAuthzRequest(tokReqMsgCtx.getScope())) {
-            boolean localClaimDialect = identityProvider.getClaimConfig().isLocalClaimDialect();
-            ClaimMapping[] idPClaimMappings = identityProvider.getClaimConfig().getClaimMappings();
-            Map<String, String> localClaims;
-
-            if (IdentityApplicationConstants.RESIDENT_IDP_RESERVED_NAME
-                    .equals(identityProvider.getIdentityProviderName())) {
-                localClaims = handleClaimsForResidentIDP(customClaimMap, identityProvider);
-            } else {
-                localClaims = handleClaimsForIDP(customClaimMap, tenantDomain, identityProvider, localClaimDialect,
-                        idPClaimMappings);
-            }
-
-            // ########################### all claims are in local dialect ############################
-
-            if (localClaims != null && localClaims.size() > 0) {
-                Map<String, String> oidcClaims;
-                try {
-                    oidcClaims = ClaimsUtil.convertClaimsToOIDCDialect(tokReqMsgCtx, localClaims);
-                } catch (IdentityApplicationManagementException | IdentityException e) {
-                    throw new IdentityOAuth2Exception("Error while converting user claims to OIDC dialect" + ".");
-                }
-                claimMappings = FrameworkUtils.buildClaimMappings(oidcClaims);
-            }
-        } else {
-            claimMappings = FrameworkUtils.buildClaimMappings(customClaimMap);
-            tokReqMsgCtx.addProperty(JWTConstants.IS_FROM_JWT_GRANT_TYPE, true);
-
+        if (mappedClaims != null) {
+            AuthenticatedUser user = tokReqMsgCtx.getAuthorizedUser();
+            user.setUserAttributes(FrameworkUtils.buildClaimMappings(mappedClaims));
+            tokReqMsgCtx.setAuthorizedUser(user);
         }
-        AuthenticatedUser user = tokReqMsgCtx.getAuthorizedUser();
-        user.setUserAttributes(claimMappings);
-        tokReqMsgCtx.setAuthorizedUser(user);
     }
 
     @Override

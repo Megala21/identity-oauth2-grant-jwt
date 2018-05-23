@@ -27,6 +27,5 @@ public class JWTConstants {
 
     // Expiry time of the jwt token
     public static final String EXPIRY_TIME = "EXPIRY_TIME_JWT";
-    public static String IS_FROM_JWT_GRANT_TYPE = "isFromJWTGrantType";
 
 }
