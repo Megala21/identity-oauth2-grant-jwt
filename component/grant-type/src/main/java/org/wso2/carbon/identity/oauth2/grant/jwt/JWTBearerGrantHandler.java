@@ -342,9 +342,8 @@ public class JWTBearerGrantHandler extends AbstractAuthorizationGrantHandler {
         if (log.isDebugEnabled()) {
             log.debug("Issuer(iss) of the JWT validated successfully");
         }
-        if (OAuth2Util.isOIDCAuthzRequest(tokReqMsgCtx.getScope())) {
-            handleCustomClaims(tokReqMsgCtx, customClaims, identityProvider);
-        }
+
+        handleCustomClaims(tokReqMsgCtx, customClaims, identityProvider);
         return true;
     }
 
@@ -363,28 +362,34 @@ public class JWTBearerGrantHandler extends AbstractAuthorizationGrantHandler {
         Map<String, String> customClaimMap = getCustomClaims(customClaims);
         Map<ClaimMapping, String> claimMappings = null;
 
-        boolean localClaimDialect = identityProvider.getClaimConfig().isLocalClaimDialect();
-        ClaimMapping[] idPClaimMappings = identityProvider.getClaimConfig().getClaimMappings();
-        Map<String, String> localClaims;
+        if (OAuth2Util.isOIDCAuthzRequest(tokReqMsgCtx.getScope())) {
+            boolean localClaimDialect = identityProvider.getClaimConfig().isLocalClaimDialect();
+            ClaimMapping[] idPClaimMappings = identityProvider.getClaimConfig().getClaimMappings();
+            Map<String, String> localClaims;
 
-        if (IdentityApplicationConstants.RESIDENT_IDP_RESERVED_NAME
-                .equals(identityProvider.getIdentityProviderName())) {
-            localClaims = handleClaimsForResidentIDP(customClaimMap, identityProvider);
-        } else {
-            localClaims = handleClaimsForIDP(customClaimMap, tenantDomain, identityProvider, localClaimDialect,
-                    idPClaimMappings);
-        }
-
-        // ########################### all claims are in local dialect ############################
-
-        if (localClaims != null && localClaims.size() > 0) {
-            Map<String, String> oidcClaims;
-            try {
-                oidcClaims = ClaimsUtil.convertClaimsToOIDCDialect(tokReqMsgCtx, localClaims);
-            } catch (IdentityApplicationManagementException | IdentityException e) {
-                throw new IdentityOAuth2Exception("Error while converting user claims to OIDC dialect" + ".");
+            if (IdentityApplicationConstants.RESIDENT_IDP_RESERVED_NAME
+                    .equals(identityProvider.getIdentityProviderName())) {
+                localClaims = handleClaimsForResidentIDP(customClaimMap, identityProvider);
+            } else {
+                localClaims = handleClaimsForIDP(customClaimMap, tenantDomain, identityProvider, localClaimDialect,
+                        idPClaimMappings);
             }
-            claimMappings = FrameworkUtils.buildClaimMappings(oidcClaims);
+
+            // ########################### all claims are in local dialect ############################
+
+            if (localClaims != null && localClaims.size() > 0) {
+                Map<String, String> oidcClaims;
+                try {
+                    oidcClaims = ClaimsUtil.convertClaimsToOIDCDialect(tokReqMsgCtx, localClaims);
+                } catch (IdentityApplicationManagementException | IdentityException e) {
+                    throw new IdentityOAuth2Exception("Error while converting user claims to OIDC dialect" + ".");
+                }
+                claimMappings = FrameworkUtils.buildClaimMappings(oidcClaims);
+            }
+        } else {
+            claimMappings = FrameworkUtils.buildClaimMappings(customClaimMap);
+            tokReqMsgCtx.addProperty(JWTConstants.IS_FROM_JWT_GRANT_TYPE, true);
+
         }
         AuthenticatedUser user = tokReqMsgCtx.getAuthorizedUser();
         user.setUserAttributes(claimMappings);
@@ -395,10 +400,9 @@ public class JWTBearerGrantHandler extends AbstractAuthorizationGrantHandler {
     public OAuth2AccessTokenRespDTO issue(OAuthTokenReqMessageContext tokReqMsgCtx) throws IdentityOAuth2Exception {
 
         OAuth2AccessTokenRespDTO tokenRespDTO = super.issue(tokReqMsgCtx);
-        if (OAuth2Util.isOIDCAuthzRequest(tokReqMsgCtx.getScope())) {
-            AuthenticatedUser user = tokReqMsgCtx.getAuthorizedUser();
-            ClaimsUtil.addUserAttributesToCache(tokenRespDTO, tokReqMsgCtx, user.getUserAttributes());
-        }
+        AuthenticatedUser user = tokReqMsgCtx.getAuthorizedUser();
+        ClaimsUtil.addUserAttributesToCache(tokenRespDTO, tokReqMsgCtx, user.getUserAttributes());
+
         return tokenRespDTO;
     }
 
