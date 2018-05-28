@@ -24,19 +24,17 @@ import com.nimbusds.jose.ReadOnlyJWSHeader;
 import com.nimbusds.jose.crypto.RSASSAVerifier;
 import com.nimbusds.jwt.ReadOnlyJWTClaimsSet;
 import com.nimbusds.jwt.SignedJWT;
+import org.apache.commons.collections.MapUtils;
 import org.apache.commons.lang.StringUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.wso2.carbon.identity.application.authentication.framework.model.AuthenticatedUser;
 import org.wso2.carbon.identity.application.authentication.framework.util.FrameworkUtils;
-import org.wso2.carbon.identity.application.common.IdentityApplicationManagementException;
-import org.wso2.carbon.identity.application.common.model.ClaimMapping;
 import org.wso2.carbon.identity.application.common.model.FederatedAuthenticatorConfig;
 import org.wso2.carbon.identity.application.common.model.IdentityProvider;
 import org.wso2.carbon.identity.application.common.model.Property;
 import org.wso2.carbon.identity.application.common.util.IdentityApplicationConstants;
 import org.wso2.carbon.identity.application.common.util.IdentityApplicationManagementUtil;
-import org.wso2.carbon.identity.base.IdentityException;
 import org.wso2.carbon.identity.core.util.IdentityUtil;
 import org.wso2.carbon.identity.oauth.config.OAuthServerConfiguration;
 import org.wso2.carbon.identity.oauth2.IdentityOAuth2Exception;
@@ -59,14 +57,7 @@ import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 import java.security.interfaces.RSAPublicKey;
 import java.text.ParseException;
-import java.util.Date;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Properties;
-
-import static org.wso2.carbon.identity.oauth2.util.ClaimsUtil.handleClaimsForIDP;
-import static org.wso2.carbon.identity.oauth2.util.ClaimsUtil.handleClaimsForResidentIDP;
+import java.util.*;
 
 /**
  * Class to handle JSON Web Token(JWT) grant type
@@ -358,14 +349,14 @@ public class JWTBearerGrantHandler extends AbstractAuthorizationGrantHandler {
      * @param identityProvider Identity Provider
      * @throws IdentityOAuth2Exception Identity Oauth2 Exception
      */
-    private void handleCustomClaims(OAuthTokenReqMessageContext tokReqMsgCtx, Map<String, Object> customClaims,
+    protected  void handleCustomClaims(OAuthTokenReqMessageContext tokReqMsgCtx, Map<String, Object> customClaims,
             IdentityProvider identityProvider) throws IdentityOAuth2Exception {
 
         Map<String, String> customClaimMap = getCustomClaims(customClaims);
         Map<String, String> mappedClaims = ClaimsUtil
                 .handleClaimMapping(identityProvider, customClaimMap, tenantDomain, tokReqMsgCtx);
 
-        if (mappedClaims != null) {
+        if (MapUtils.isNotEmpty(mappedClaims)) {
             AuthenticatedUser user = tokReqMsgCtx.getAuthorizedUser();
             user.setUserAttributes(FrameworkUtils.buildClaimMappings(mappedClaims));
             tokReqMsgCtx.setAuthorizedUser(user);
@@ -388,7 +379,7 @@ public class JWTBearerGrantHandler extends AbstractAuthorizationGrantHandler {
      * @param customClaims Relevant custom claims
      * @return custom claims.
      */
-    private Map<String, String> getCustomClaims(Map<String, Object> customClaims) {
+    protected Map<String, String> getCustomClaims(Map<String, Object> customClaims) {
 
         Map<String, String> customClaimMap = new HashMap<>();
         for (Map.Entry<String, Object> entry : customClaims.entrySet()) {
