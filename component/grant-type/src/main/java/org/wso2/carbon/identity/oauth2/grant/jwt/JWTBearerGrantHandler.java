@@ -30,6 +30,7 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.wso2.carbon.identity.application.authentication.framework.model.AuthenticatedUser;
 import org.wso2.carbon.identity.application.authentication.framework.util.FrameworkUtils;
+import org.wso2.carbon.identity.application.common.IdentityApplicationManagementException;
 import org.wso2.carbon.identity.application.common.model.FederatedAuthenticatorConfig;
 import org.wso2.carbon.identity.application.common.model.IdentityProvider;
 import org.wso2.carbon.identity.application.common.model.Property;
@@ -353,14 +354,17 @@ public class JWTBearerGrantHandler extends AbstractAuthorizationGrantHandler {
             IdentityProvider identityProvider) throws IdentityOAuth2Exception {
 
         Map<String, String> customClaimMap = getCustomClaims(customClaims);
-        Map<String, String> mappedClaims = ClaimsUtil
-                .handleClaimMapping(identityProvider, customClaimMap, tenantDomain, tokReqMsgCtx);
-
-        if (MapUtils.isNotEmpty(mappedClaims)) {
-            AuthenticatedUser user = tokReqMsgCtx.getAuthorizedUser();
-            user.setUserAttributes(FrameworkUtils.buildClaimMappings(mappedClaims));
-            tokReqMsgCtx.setAuthorizedUser(user);
+        Map<String, String> mappedClaims = null;
+        try {
+            mappedClaims = ClaimsUtil
+                    .handleClaimMapping(identityProvider, customClaimMap, tenantDomain, tokReqMsgCtx);
+        } catch (IdentityApplicationManagementException e) {
+            throw new IdentityOAuth2Exception("Error while handling custom claim mapping for the tenant domain, " +
+                    tenantDomain, e);
         }
+        AuthenticatedUser user = tokReqMsgCtx.getAuthorizedUser();
+        user.setUserAttributes(FrameworkUtils.buildClaimMappings(mappedClaims));
+        tokReqMsgCtx.setAuthorizedUser(user);
     }
 
     @Override

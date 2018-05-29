@@ -29,6 +29,7 @@ import org.testng.annotations.DataProvider;
 import org.testng.annotations.ObjectFactory;
 import org.testng.annotations.Test;
 import org.wso2.carbon.identity.application.authentication.framework.model.AuthenticatedUser;
+import org.wso2.carbon.identity.application.common.IdentityApplicationManagementException;
 import org.wso2.carbon.identity.application.common.model.IdentityProvider;
 import org.wso2.carbon.identity.oauth2.IdentityOAuth2Exception;
 import org.wso2.carbon.identity.oauth2.token.OAuthTokenReqMessageContext;
@@ -69,7 +70,8 @@ public class JWTBearerGrantHandlerTest {
     @SuppressWarnings("unchecked")
     @Test(description = "This method tests whether handling custom claims is happening as expected", dataProvider =
             "customClaimDataProvider")
-    public void testHandleCustomClaims(Map<String, Object> customClaims) throws IdentityOAuth2Exception {
+    public void testHandleCustomClaims(Map<String, Object> customClaims)
+            throws IdentityOAuth2Exception, IdentityApplicationManagementException {
 
         PowerMockito.mockStatic(ClaimsUtil.class);
         when(ClaimsUtil.handleClaimMapping(Mockito.any(IdentityProvider.class), Mockito.anyMap(), Mockito.anyString(),
